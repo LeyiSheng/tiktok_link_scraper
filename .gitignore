@@ -1,0 +1,31 @@
+# 浏览器持久化数据（含登录 cookie，不上传）
+browser_data/
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# 抓取结果（本地数据，不上传）
+scraped_data.json
+diagnose_urls.txt
+
+# 诊断脚本（开发用，不上传）
+diagnose*.py
+
+# 虚拟环境
+venv/
+.venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# macOS
+.DS_Store
+
+# 环境变量
+.env
