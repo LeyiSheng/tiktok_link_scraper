@@ -12,6 +12,7 @@ class VideoItem:
     title: str
     author: str
     platform: str
+    canonical_url: str = ""
     raw_text: str = ""   # 抖音 V 键复制的完整分享文本（含标题、话题标签、链接）
     scraped_at: str = field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
@@ -19,6 +20,7 @@ class VideoItem:
         """用于 Streamlit 表格展示（不含 raw_text 以保持简洁）"""
         return {
             "URL": self.url,
+            "完整链接": self.canonical_url or self.url,
             "标题/描述": self.title,
             "作者": self.author,
             "平台": self.platform,
@@ -29,6 +31,7 @@ class VideoItem:
         """用于 JSON 导出（包含完整原始文本）"""
         return {
             "url": self.url,
+            "canonical_url": self.canonical_url,
             "title": self.title,
             "author": self.author,
             "platform": self.platform,

@@ -12,7 +12,6 @@ main.py — 命令行启动脚本
 
 import argparse
 import asyncio
-import json
 import signal
 import sys
 import threading
@@ -22,6 +21,7 @@ from pathlib import Path
 import config
 from scraper.browser import close_browser
 from scraper.crawler import run_scraping_session
+from scraper.douyin_downloader import DouyinDownloadBridge
 from scraper.models import VideoItem
 
 
@@ -49,6 +49,17 @@ def parse_args():
         action="store_true",
         help="无界面模式（默认: 显示浏览器）",
     )
+    parser.add_argument(
+        "--download-douyin",
+        action="store_true",
+        help="抓到新的抖音分享链接后，立即调用 DouYin_Spider 下载对应作品",
+    )
+    parser.add_argument(
+        "--download-save-choice",
+        default="media",
+        choices=["all", "media", "media-video", "media-image", "excel"],
+        help="传给 DouYin_Spider 的保存方式，默认 media",
+    )
     return parser.parse_args()
 
 
@@ -61,6 +72,11 @@ async def main(args) -> None:
     config.HEADLESS = args.headless
     output_path = Path(args.output)
     stop_event = threading.Event()
+    downloader = None
+    last_seen_count = 0
+
+    if args.download_douyin:
+        downloader = DouyinDownloadBridge(save_choice=args.download_save_choice)
 
     # Ctrl+C 优雅退出
     def _sigint(sig, frame):
@@ -71,30 +87,38 @@ async def main(args) -> None:
 
     print_status(f"🚀 开始抓取 {'抖音' if args.platform == 'douyin' else 'TikTok'}，目标 {args.max} 条")
     print_status(f"📁 结果保存到: {output_path.resolve()}")
+    if downloader:
+        print_status(f"⬇️  新抓到的抖音链接将立即下载（save_choice={args.download_save_choice}）")
     print_status("（按 Ctrl+C 可随时停止）\n")
 
     async def on_new_items(items: list, message: str) -> None:
+        nonlocal last_seen_count
         print_status(message)
 
-        # 同步写入 JSON（crawler 内部已做，这里不重复写；仅打印进度）
-        # 如果用户指定了自定义输出文件，则在这里写
-        if str(output_path) != "scraped_data.json" and items:
+        if not downloader or args.platform != "douyin":
+            return
+
+        if message.startswith("📚 已加载历史数据"):
+            last_seen_count = len(items)
+            return
+
+        if len(items) <= last_seen_count:
+            return
+
+        new_items = items[last_seen_count:]
+        last_seen_count = len(items)
+        for item in new_items:
             try:
-                output_path.write_text(
-                    json.dumps(
-                        [i.to_json_dict() for i in items],
-                        ensure_ascii=False,
-                        indent=2,
-                    ),
-                    encoding="utf-8",
-                )
-            except Exception as e:
-                print_status(f"[写入] 失败: {e}")
+                save_path = await asyncio.to_thread(downloader.download, item.url)
+                print_status(f"⬇️  下载完成: {item.url} -> {save_path}")
+            except Exception as exc:
+                print_status(f"❌ 下载失败: {item.url} ({exc})")
 
     try:
         result = await run_scraping_session(
             platform=args.platform,
             max_items=args.max,
+            output_path=str(output_path),
             on_new_items=on_new_items,
             stop_event=stop_event,
         )

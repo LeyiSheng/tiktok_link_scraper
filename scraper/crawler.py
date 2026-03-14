@@ -16,6 +16,8 @@ import json as json_mod
 import random
 import re
 import threading
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Awaitable, Callable, List, Optional, Set, Tuple
 
@@ -153,6 +155,49 @@ async def get_video_url_via_clipboard(page: Page) -> Tuple[Optional[str], str]:
     return url, clipboard_text
 
 
+_AWEME_PATTERNS = [
+    re.compile(r"/video/(\d+)"),
+    re.compile(r"/note/(\d+)"),
+    re.compile(r"[?&]modal_id=(\d+)"),
+    re.compile(r"/share/video/(\d+)"),
+]
+
+
+def _extract_aweme_id(url: str) -> str:
+    for pattern in _AWEME_PATTERNS:
+        match = pattern.search(url)
+        if match:
+            return match.group(1)
+    return ""
+
+
+def resolve_douyin_canonical_url(url: str) -> str:
+    aweme_id = _extract_aweme_id(url)
+    if aweme_id:
+        return f"https://www.douyin.com/video/{aweme_id}"
+
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/123.0.0.0 Safari/537.36"
+                )
+            },
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            final_url = resp.geturl()
+    except (urllib.error.URLError, ValueError):
+        return url
+
+    aweme_id = _extract_aweme_id(final_url)
+    if aweme_id:
+        return f"https://www.douyin.com/video/{aweme_id}"
+    return final_url or url
+
+
 
 async def get_video_meta_from_dom(page: Page) -> dict:
     """
@@ -254,6 +299,7 @@ async def extract_video_items(
 async def run_scraping_session(
     platform: str,
     max_items: int,
+    output_path: str = "scraped_data.json",
     on_new_items: Optional[Callable[[List[VideoItem], str], Awaitable[None]]] = None,
     stop_event: Optional[threading.Event] = None,
 ) -> List[VideoItem]:
@@ -270,13 +316,44 @@ async def run_scraping_session(
       滚动 + <a> 标签扫描
     """
     cfg = config.PLATFORM_CONFIG[platform]
+    json_path = Path(output_path)
     all_items: List[VideoItem] = []
     seen_urls: Set[str] = set()
-    json_path = Path("scraped_data.json")
+
+    # 启动时加载历史数据，避免覆盖并做 URL 去重
+    if json_path.exists():
+        try:
+            raw = json_mod.loads(json_path.read_text(encoding="utf-8"))
+            if isinstance(raw, list):
+                for item in raw:
+                    if not isinstance(item, dict):
+                        continue
+                    url = str(item.get("url", "")).strip()
+                    if not url or url in seen_urls:
+                        continue
+                    parsed_scraped_at = str(item.get("scraped_at", "")).strip()
+                    payload = dict(
+                        url=url,
+                        canonical_url=str(item.get("canonical_url", "")).strip(),
+                        title=str(item.get("title", "（无描述）")).strip() or "（无描述）",
+                        author=str(item.get("author", "未知")).strip() or "未知",
+                        platform=str(item.get("platform", cfg["name"])).strip() or cfg["name"],
+                        raw_text=str(item.get("raw_text", "")),
+                    )
+                    if parsed_scraped_at:
+                        payload["scraped_at"] = parsed_scraped_at
+                    all_items.append(VideoItem(**payload))
+                    seen_urls.add(url)
+        except Exception as e:
+            print(f"[JSON] 读取历史数据失败: {e}")
 
     page = await create_stealth_page()
+    existing_count = len(all_items)
 
     try:
+        if all_items:
+            await _notify(on_new_items, all_items, f"📚 已加载历史数据 {len(all_items)} 条，继续追加抓取")
+
         await _notify(on_new_items, [], f"📂 正在打开 {cfg['name']} 首页…")
         await page.goto(cfg["start_url"], timeout=config.PAGE_LOAD_TIMEOUT, wait_until="domcontentloaded")
         await asyncio.sleep(3)
@@ -298,8 +375,9 @@ async def run_scraping_session(
             await asyncio.sleep(3)
 
         no_new_rounds = 0
+        last_copied_text: Optional[str] = None
 
-        while len(all_items) < max_items:
+        while (len(all_items) - existing_count) < max_items:
             if stop_event and stop_event.is_set():
                 await _notify(on_new_items, all_items, "🛑 用户手动停止")
                 break
@@ -317,15 +395,34 @@ async def run_scraping_session(
             # ── 抖音：V 键 → 剪贴板 → 提取链接 ──
             if platform == "douyin":
                 url, raw_text = await get_video_url_via_clipboard(page)
+                current_copied_text = raw_text.strip()
+
+                # 连续两次复制内容相同则跳过，不保存
+                if current_copied_text and current_copied_text == last_copied_text:
+                    no_new_rounds += 1
+                    await _notify(
+                        on_new_items,
+                        all_items,
+                        f"⏳ 切换视频中…已抓取 {len(all_items)} 条（连续 {no_new_rounds} 轮无新内容 （复制内容与上一条相同））",
+                    )
+                    await asyncio.sleep(random.uniform(config.SCROLL_PAUSE_MIN, config.SCROLL_PAUSE_MAX))
+                    await page.keyboard.press("ArrowDown")
+                    await asyncio.sleep(1.5)
+                    continue
+
+                if current_copied_text:
+                    last_copied_text = current_copied_text
 
                 if url and url not in seen_urls:
                     seen_urls.add(url)
                     meta = await get_video_meta_from_dom(page)
+                    canonical_url = await asyncio.to_thread(resolve_douyin_canonical_url, url)
                     title = " ".join((meta.get("title") or "（无描述）").split())
                     author = meta.get("author") or "未知"
 
                     item = VideoItem(
                         url=url,
+                        canonical_url=canonical_url,
                         title=title,
                         author=author,
                         platform=cfg["name"],

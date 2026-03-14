@@ -26,6 +26,23 @@ python3 main.py --output data.json  # 自定义输出文件
 python3 main.py --headless          # 无界面模式
 ```
 
+持续运行并在异常退出后自动重启：
+
+```bash
+chmod +x run_forever.sh
+./run_forever.sh
+```
+
+可选环境变量：
+
+```bash
+PYTHON_BIN=/Users/tailab/miniconda3/envs/tiktok/bin/python RESTART_DELAY=15 ./run_forever.sh
+```
+
+日志文件：
+- `logs/runner.log`：守护脚本启动/重启记录
+- `logs/app.log`：`main.py` 标准输出和错误输出
+
 ## 输出格式
 
 `scraped_data.json`：
