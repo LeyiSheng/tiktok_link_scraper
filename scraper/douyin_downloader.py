@@ -36,20 +36,31 @@ class DouyinDownloadBridge:
             self._data_spider = Data_Spider()
             self._initialized = True
 
-    def download(self, url: str) -> str:
+    def download(self, url: str, canonical_url: str = "") -> str:
+        save_path, _ = self.download_with_work_info(url, canonical_url)
+        return save_path
+
+    def fetch_work_info(self, url: str, canonical_url: str = "") -> dict:
         self._ensure_ready()
 
-        work_info = self._data_spider.spider_work(self._auth, url)
+        work_url = canonical_url or url
+        return self._data_spider.spider_work(self._auth, work_url)
+
+    def download_with_work_info(self, url: str, canonical_url: str = "") -> tuple[str, dict]:
+        self._ensure_ready()
+
+        work_info = self.fetch_work_info(url, canonical_url)
         if self.save_choice == "all" or "media" in self.save_choice:
             from utils.data_util import download_work
 
-            return download_work(work_info, self._base_path["media"], self.save_choice)
+            save_path = download_work(work_info, self._base_path["media"], self.save_choice)
+            return save_path, work_info
 
         if self.save_choice == "excel":
             from utils.data_util import save_to_xlsx
 
             file_path = self.project_root / "datas" / "excel_datas" / "single_link_import.xlsx"
             save_to_xlsx([work_info], str(file_path))
-            return str(file_path)
+            return str(file_path), work_info
 
         raise ValueError(f"不支持的 save_choice: {self.save_choice}")

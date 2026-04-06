@@ -5,7 +5,7 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 LOG_DIR="$SCRIPT_DIR/logs"
 RUN_LOG="$LOG_DIR/runner.log"
-APP_LOG="$LOG_DIR/app.log"
+APP_LOG="$LOG_DIR/app2.log"
 RESTART_DELAY="${RESTART_DELAY:-10}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 

@@ -157,10 +157,15 @@ with st.sidebar:
 
     platform_display = st.radio(
         "目标平台",
-        options=["抖音 (Douyin)", "TikTok"],
+        options=["抖音 (Douyin)", "TikTok", "YouTube Shorts"],
         index=0,
     )
-    platform_key = "douyin" if "抖音" in platform_display else "tiktok"
+    if "抖音" in platform_display:
+        platform_key = "douyin"
+    elif "TikTok" in platform_display:
+        platform_key = "tiktok"
+    else:
+        platform_key = "youtube"
 
     max_items = st.slider(
         "最大抓取数量",

@@ -6,11 +6,10 @@ scraper/browser.py — 隐身浏览器实例管理
   2. 注入 playwright-stealth 以及额外的 JS 反指纹脚本
   3. 提供工厂函数 create_stealth_page() 返回已配置好的 Page
 """
-import asyncio
 from pathlib import Path
 from typing import Optional
 
-from playwright.async_api import async_playwright, BrowserContext, Page, Playwright
+from playwright.async_api import Browser, BrowserContext, Page, Playwright, async_playwright
 
 try:
     # playwright-stealth v1.x
@@ -77,70 +76,135 @@ if (navigator.plugins.length === 0) {
 
 
 _playwright_instance: Optional[Playwright] = None
+_browser: Optional[Browser] = None
 _browser_context: Optional[BrowserContext] = None
+_browser_context_platform: Optional[str] = None
+_attached_to_real_chrome: bool = False
+
+_SYSTEM_CHROME_CANDIDATES = [
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+]
 
 
-async def _get_or_create_context() -> BrowserContext:  # type: ignore[return]
-    """获取（或首次创建）持久化浏览器上下文。"""
-    global _playwright_instance, _browser_context
+def _find_browser_executable() -> Optional[str]:
+    for candidate in _SYSTEM_CHROME_CANDIDATES:
+        if Path(candidate).exists():
+            return candidate
+    return None
 
-    if _browser_context is not None:
-        return _browser_context
 
-    storage_path = Path(config.BROWSER_STORAGE_DIR).resolve()
-    storage_path.mkdir(parents=True, exist_ok=True)
+def _get_storage_path(platform: str) -> Path:
+    base = Path(config.BROWSER_STORAGE_DIR).resolve()
+    return base / platform
 
-    _playwright_instance = await async_playwright().start()
 
-    # 真实 Chrome User-Agent
+def _build_launch_kwargs(platform: str, executable_path: Optional[str], storage_path: Path) -> dict:
+    common = {
+        "user_data_dir": str(storage_path),
+        "executable_path": executable_path,
+        "channel": "chrome" if executable_path and "Google Chrome.app" in executable_path else None,
+        "headless": config.HEADLESS,
+        "viewport": {"width": 1440, "height": 900},
+        "permissions": ["clipboard-read", "clipboard-write"],
+    }
+
+    if platform == "tiktok":
+        # TikTok 登录阶段更容易被“过于工整”的自动化配置触发风控。
+        # 这里尽量贴近系统 Chrome 默认环境，只保留必要能力。
+        common["args"] = [
+            "--no-first-run",
+            "--no-default-browser-check",
+        ]
+        return common
+
     user_agent = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/122.0.0.0 Safari/537.36"
     )
-
-    _browser_context = await _playwright_instance.chromium.launch_persistent_context(
-        user_data_dir=str(storage_path),
-        headless=config.HEADLESS,
-        args=[
-            "--no-sandbox",
-            "--disable-blink-features=AutomationControlled",
-            "--disable-infobars",
-            "--disable-dev-shm-usage",
-        ],
-        user_agent=user_agent,
-        viewport={"width": 1440, "height": 900},
-        locale="zh-CN",
-        timezone_id="Asia/Shanghai",
-        # 授权剪贴板读写权限（用于按 V 键后读取视频链接）
-        permissions=["clipboard-read", "clipboard-write"],
+    common.update(
+        {
+            "args": [
+                "--no-sandbox",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-infobars",
+                "--disable-dev-shm-usage",
+            ],
+            "user_agent": user_agent,
+            "locale": "zh-CN",
+            "timezone_id": "Asia/Shanghai",
+        }
     )
+    return common
 
-    # 注入反指纹脚本到所有未来页面
-    await _browser_context.add_init_script(_ANTI_FINGERPRINT_JS)
+
+async def _get_or_create_context(platform: str = "douyin") -> BrowserContext:  # type: ignore[return]
+    """获取（或首次创建）持久化浏览器上下文。"""
+    global _playwright_instance, _browser, _browser_context, _browser_context_platform, _attached_to_real_chrome
+
+    if _browser_context is not None:
+        if _browser_context_platform != platform:
+            print(
+                f"[browser] 当前上下文基于 {_browser_context_platform} 配置启动，继续复用；"
+                f"如需切到 {platform} 配置，请先重启本次程序。"
+            )
+        return _browser_context
+
+    _playwright_instance = await async_playwright().start()
+    if config.ATTACH_REAL_CHROME:
+        endpoint = f"http://127.0.0.1:{config.CHROME_DEBUG_PORT}"
+        print(f"[browser] 连接真实 Chrome: {endpoint}")
+        _browser = await _playwright_instance.chromium.connect_over_cdp(endpoint)
+        _attached_to_real_chrome = True
+        if _browser.contexts:
+            _browser_context = _browser.contexts[0]
+        else:
+            _browser_context = await _browser.new_context()
+        _browser_context_platform = platform
+    else:
+        storage_path = _get_storage_path(platform)
+        storage_path.mkdir(parents=True, exist_ok=True)
+        print(f"[browser] 使用配置目录: {storage_path}")
+
+        executable_path = _find_browser_executable()
+        if executable_path:
+            print(f"[browser] 使用系统浏览器: {executable_path}")
+        else:
+            print("[browser] 未找到系统 Chrome，回退到 Playwright 内置 Chromium。")
+
+        _browser_context = await _playwright_instance.chromium.launch_persistent_context(
+            **_build_launch_kwargs(platform, executable_path, storage_path),
+        )
+        _browser_context_platform = platform
+
+        if platform != "tiktok":
+            # 抖音保留现有的反检测增强；TikTok 登录阶段先避免额外注入。
+            await _browser_context.add_init_script(_ANTI_FINGERPRINT_JS)
 
     # 显式授权剪贴板权限（覆盖 browser_data 可能缓存的旧设置）
     # 这是 V 键复制视频链接后能通过 JS 读取剪贴板的前提
-    await _browser_context.grant_permissions(
-        ["clipboard-read", "clipboard-write"],
-        origin="https://www.douyin.com",
-    )
+    for origin in ("https://www.douyin.com", "https://www.tiktok.com"):
+        await _browser_context.grant_permissions(
+            ["clipboard-read", "clipboard-write"],
+            origin=origin,
+        )
 
     return _browser_context
 
 
-async def create_stealth_page() -> Page:
+async def create_stealth_page(platform: str = "douyin") -> Page:
     """
     创建并返回一个已应用 stealth 的新页面。
 
     Returns:
         playwright Page 对象（已注入反检测脚本）
     """
-    ctx = await _get_or_create_context()
+    ctx = await _get_or_create_context(platform)
     page = await ctx.new_page()
 
-    # 应用 playwright-stealth（兼容 v1.x 和 v2.x）
-    if _HAS_STEALTH:
+    # TikTok 登录阶段先避免额外 stealth 注入，降低风控触发概率。
+    if _HAS_STEALTH and platform != "tiktok":
         if _STEALTH_V2:
             await _Stealth().apply_stealth_async(page)
         else:
@@ -151,11 +215,21 @@ async def create_stealth_page() -> Page:
 
 async def close_browser() -> None:
     """关闭浏览器上下文并清理资源。"""
-    global _playwright_instance, _browser_context
+    global _playwright_instance, _browser, _browser_context, _browser_context_platform, _attached_to_real_chrome
 
     if _browser_context:
-        await _browser_context.close()
-        _browser_context = None
+        if _attached_to_real_chrome:
+            _browser_context = None
+            _browser_context_platform = None
+        else:
+            await _browser_context.close()
+            _browser_context = None
+            _browser_context_platform = None
+
+    if _browser:
+        await _browser.close()
+        _browser = None
+        _attached_to_real_chrome = False
 
     if _playwright_instance:
         await _playwright_instance.stop()
